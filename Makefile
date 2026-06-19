@@ -10,8 +10,8 @@ build:
 
 install: build
 	install -d $(BINDIR)
-	install -m 755 server $(BINDIR)/claude-live-server
-	install -m 755 client $(BINDIR)/claude-live-client
+	install -m 755 server $(BINDIR)/claudesrv-server
+	install -m 755 client $(BINDIR)/claudesrv-client
 
 clean:
 	rm -f server client
