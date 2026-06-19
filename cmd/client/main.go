@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,11 +19,11 @@ import (
 	"github.com/c0dev0id/claude-live-coding/internal/event"
 )
 
-// rawEntry is the top-level structure of a JSONL line.
 type rawEntry struct {
 	Type    string      `json:"type"`
 	IsMeta  bool        `json:"isMeta"`
 	Message *rawMessage `json:"message"`
+	CWD     string      `json:"cwd"`
 }
 
 type rawMessage struct {
@@ -34,38 +35,47 @@ type contentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text"`
 	Name      string          `json:"name"`
+	ID        string          `json:"id"`
 	Input     json.RawMessage `json:"input"`
 	ToolUseID string          `json:"tool_use_id"`
 }
 
-func parseEntry(line []byte) []event.Event {
+// parser holds state across JSONL lines within a single session.
+type parser struct {
+	cwd          string
+	pendingEdits map[string]string // tool_use_id → file path
+	genDiffs     bool
+}
+
+func (p *parser) parse(line []byte) []event.Event {
 	var entry rawEntry
 	if err := json.Unmarshal(line, &entry); err != nil || entry.Message == nil {
 		return nil
 	}
+	if entry.CWD != "" {
+		p.cwd = entry.CWD
+	}
 
-	msg := entry.Message
 	now := time.Now().UnixMilli()
+	msg := entry.Message
 
 	switch entry.Type {
 	case "user":
 		if entry.IsMeta {
 			return nil
 		}
-		return parseUserContent(msg.Content, now)
-
+		return p.parseUserContent(msg.Content, now)
 	case "assistant":
-		return parseAssistantContent(msg.Content, now)
+		return p.parseAssistantContent(msg.Content, now)
 	}
 	return nil
 }
 
-func parseUserContent(raw json.RawMessage, ts int64) []event.Event {
-	// content can be a plain string (user typed) or an array of blocks (tool results, etc.)
+func (p *parser) parseUserContent(raw json.RawMessage, ts int64) []event.Event {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
 		if strings.HasPrefix(s, "<") {
-			return nil // slash command or system XML
+			return nil
 		}
 		return []event.Event{{Kind: event.KindUser, Text: s, Ts: ts}}
 	}
@@ -74,19 +84,30 @@ func parseUserContent(raw json.RawMessage, ts int64) []event.Event {
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil
 	}
-	var parts []string
+
+	var events []event.Event
 	for _, b := range blocks {
 		if b.Type == "text" && !strings.HasPrefix(b.Text, "<") {
-			parts = append(parts, b.Text)
+			events = append(events, event.Event{Kind: event.KindUser, Text: b.Text, Ts: ts})
+		}
+		if b.Type == "tool_result" && p.genDiffs {
+			if file, ok := p.pendingEdits[b.ToolUseID]; ok {
+				delete(p.pendingEdits, b.ToolUseID)
+				if diff := gitDiff(p.cwd, file); diff != "" {
+					events = append(events, event.Event{
+						Kind: event.KindDiff,
+						File: file,
+						Text: diff,
+						Ts:   ts,
+					})
+				}
+			}
 		}
 	}
-	if len(parts) == 0 {
-		return nil
-	}
-	return []event.Event{{Kind: event.KindUser, Text: strings.Join(parts, "\n"), Ts: ts}}
+	return events
 }
 
-func parseAssistantContent(raw json.RawMessage, ts int64) []event.Event {
+func (p *parser) parseAssistantContent(raw json.RawMessage, ts int64) []event.Event {
 	var blocks []contentBlock
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil
@@ -103,9 +124,26 @@ func parseAssistantContent(raw json.RawMessage, ts int64) []event.Event {
 				Text:     summarizeInput(b.Name, b.Input),
 				Ts:       ts,
 			})
+			if b.Name == "Write" || b.Name == "Edit" {
+				if file := extractFilePath(b.Input); file != "" {
+					p.pendingEdits[b.ID] = file
+				}
+			}
 		}
 	}
 	return events
+}
+
+func extractFilePath(raw json.RawMessage) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	var s string
+	if v, ok := m["file_path"]; ok {
+		json.Unmarshal(v, &s)
+	}
+	return s
 }
 
 func summarizeInput(toolName string, raw json.RawMessage) string {
@@ -113,7 +151,6 @@ func summarizeInput(toolName string, raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return toolName
 	}
-	// prefer the most descriptive key for each tool type
 	for _, key := range []string{"description", "command", "file_path", "pattern", "prompt", "query", "path"} {
 		if v, ok := m[key]; ok {
 			var s string
@@ -123,6 +160,25 @@ func summarizeInput(toolName string, raw json.RawMessage) string {
 		}
 	}
 	return toolName
+}
+
+func gitDiff(cwd, file string) string {
+	if cwd == "" || file == "" {
+		return ""
+	}
+	// make path relative so git diff works regardless of how file_path was stored
+	rel := file
+	if filepath.IsAbs(file) {
+		var err error
+		rel, err = filepath.Rel(cwd, file)
+		if err != nil {
+			return ""
+		}
+	}
+	cmd := exec.Command("git", "diff", "HEAD", "--", rel)
+	cmd.Dir = cwd
+	out, _ := cmd.Output()
+	return string(out)
 }
 
 func postEvent(server string, e event.Event) error {
@@ -198,25 +254,28 @@ func tailFile(path string, server string) error {
 		return err
 	}
 
+	p := &parser{pendingEdits: make(map[string]string)}
+
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 
-	sendLine := func(line []byte) {
-		events := parseEntry(line)
-		for _, e := range events {
+	send := func(line []byte) {
+		for _, e := range p.parse(line) {
 			postWithRetry(server, e)
 		}
 	}
 
-	// replay existing content
+	// replay existing content without generating diffs
 	for scanner.Scan() {
-		sendLine(scanner.Bytes())
+		send(scanner.Bytes())
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
 
-	// stream new content
+	// switch to live mode: diffs are now generated
+	p.genDiffs = true
+
 	reader := bufio.NewReader(f)
 	for {
 		select {
@@ -228,7 +287,7 @@ func tailFile(path string, server string) error {
 				for {
 					line, err := reader.ReadBytes('\n')
 					if len(line) > 0 {
-						sendLine(bytes.TrimRight(line, "\n"))
+						send(bytes.TrimRight(line, "\n"))
 					}
 					if err == io.EOF {
 						break
