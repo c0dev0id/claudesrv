@@ -18,6 +18,12 @@
   .entry-assistant .label { color: #3fb950; }
   .entry-tool { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; color: #6e7681; font-size: 13px; }
   .entry-tool .tool-name { color: #8b949e; font-weight: 600; min-width: 70px; }
+  .entry-diff { margin-bottom: 12px; }
+  .diff-header { font-size: 12px; color: #8b949e; margin-bottom: 4px; font-family: 'Fira Code', 'Cascadia Code', monospace; }
+  .diff-body { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 14px; overflow-x: auto; font-family: 'Fira Code', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; white-space: pre; }
+  .diff-add { color: #3fb950; display: block; }
+  .diff-del { color: #f85149; display: block; }
+  .diff-hunk { color: #6e7681; display: block; }
   .bubble { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 18px; }
   .entry-user .bubble { border-color: #1f3d5c; }
   /* markdown styles */
@@ -65,7 +71,11 @@
     const div = document.createElement('div');
     div.className = 'entry';
 
-    if (ev.kind === 'tool') {
+    if (ev.kind === 'diff') {
+      div.classList.add('entry-diff');
+      div.innerHTML = '<div class="diff-header">── ' + escHtml(ev.file || '') + '</div>'
+                    + '<div class="diff-body">' + renderDiff(ev.text || '') + '</div>';
+    } else if (ev.kind === 'tool') {
       div.classList.add('entry-tool');
       div.innerHTML = '<span class="tool-name">' + escHtml(ev.tool_name || 'tool') + '</span>'
                     + '<span>' + escHtml(ev.text || '') + '</span>';
@@ -92,6 +102,16 @@
 
   function escHtml(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function renderDiff(text) {
+    return text.split('\n').map(line => {
+      if (line.startsWith('+++') || line.startsWith('---')) return escHtml(line);
+      if (line.startsWith('+')) return '<span class="diff-add">' + escHtml(line) + '</span>';
+      if (line.startsWith('-')) return '<span class="diff-del">' + escHtml(line) + '</span>';
+      if (line.startsWith('@@'))  return '<span class="diff-hunk">' + escHtml(line) + '</span>';
+      return escHtml(line);
+    }).join('\n');
   }
 
   function connect() {
